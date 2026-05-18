@@ -1,0 +1,523 @@
+package apply
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/crtwheel/cartify/src/utils"
+)
+
+// Flag enables/disables additional feature
+type Flag struct {
+	CurrentTheme         string
+	ColorScheme          string
+	InjectThemeJS        bool
+	CheckCartifyUpdate bool
+	Extension            []string
+	CustomApp            []string
+	SidebarConfig        bool
+	HomeConfig           bool
+	ExpFeatures          bool
+	CartifyVer         string
+	SpotifyVer           string
+}
+
+// AdditionalOptions .
+func AdditionalOptions(appsFolderPath string, flags Flag) {
+	jsModifiers := []func(path string, flags Flag){
+		insertExpFeatures,
+		insertSidebarConfig,
+		insertHomeConfig,
+	}
+	filesToModified := map[string][]func(path string, flags Flag){
+		filepath.Join(appsFolderPath, "xpui", "index.html"): {
+			htmlMod,
+		},
+		filepath.Join(appsFolderPath, "xpui", "xpui.js"):         jsModifiers,
+		filepath.Join(appsFolderPath, "xpui", "xpui-modules.js"): jsModifiers,
+		filepath.Join(appsFolderPath, "xpui", "xpui-snapshot.js"): {
+			insertCustomApp,
+		},
+		filepath.Join(appsFolderPath, "xpui", "home-v2.js"): {
+			insertHomeConfig,
+		},
+		filepath.Join(appsFolderPath, "xpui", "xpui-desktop-modals.js"): {
+			insertVersionInfo,
+		},
+	}
+
+	verParts := strings.Split(flags.SpotifyVer, ".")
+	spotifyMajor, spotifyMinor, spotifyPatch := 0, 0, 0
+	if len(verParts) > 0 {
+		spotifyMajor, _ = strconv.Atoi(verParts[0])
+	}
+	if len(verParts) > 1 {
+		spotifyMinor, _ = strconv.Atoi(verParts[1])
+	}
+	if len(verParts) > 2 {
+		spotifyPatch, _ = strconv.Atoi(verParts[2])
+	}
+
+	filesToModified[filepath.Join(appsFolderPath, "xpui", "xpui.js")] = append(filesToModified[filepath.Join(appsFolderPath, "xpui", "xpui.js")], insertCustomApp)
+	if spotifyMajor >= 1 && spotifyMinor >= 2 && spotifyPatch >= 57 {
+		filesToModified[filepath.Join(appsFolderPath, "xpui", "xpui.js")] = append(filesToModified[filepath.Join(appsFolderPath, "xpui", "xpui.js")], insertExpFeatures)
+	} else {
+		filesToModified[filepath.Join(appsFolderPath, "xpui", "vendor~xpui.js")] = []func(string, Flag){insertExpFeatures}
+	}
+
+	if flags.SidebarConfig {
+		if err := utils.CopyFile(
+			filepath.Join(utils.GetJsHelperDir(), "sidebarConfig.js"),
+			filepath.Join(appsFolderPath, "xpui", "helper")); err != nil {
+			utils.PrintError(err.Error())
+			flags.SidebarConfig = false
+		}
+	}
+
+	if flags.HomeConfig {
+		if err := utils.CopyFile(
+			filepath.Join(utils.GetJsHelperDir(), "homeConfig.js"),
+			filepath.Join(appsFolderPath, "xpui", "helper")); err != nil {
+			utils.PrintError(err.Error())
+			flags.HomeConfig = false
+		}
+	}
+
+	if flags.ExpFeatures {
+		if err := utils.CopyFile(
+			filepath.Join(utils.GetJsHelperDir(), "expFeatures.js"),
+			filepath.Join(appsFolderPath, "xpui", "helper")); err != nil {
+			utils.PrintError(err.Error())
+			flags.ExpFeatures = false
+		}
+	}
+
+	for file, calls := range filesToModified {
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			continue
+		}
+
+		for _, call := range calls {
+			call(file, flags)
+		}
+	}
+}
+
+// UserCSS creates colors.css user.css files in "xpui".
+// To not use custom css, set `themeFolder` to blank string
+// To use default color scheme, set `scheme` to `nil`
+func UserCSS(appsFolderPath, themeFolder string, scheme map[string]string) {
+	colorsDest := filepath.Join(appsFolderPath, "xpui", "colors.css")
+	if err := os.WriteFile(colorsDest, []byte(getColorCSS(scheme)), 0700); err != nil {
+		utils.Fatal(err)
+	}
+	cssDest := filepath.Join(appsFolderPath, "xpui", "user.css")
+	if err := os.WriteFile(cssDest, []byte(getUserCSS(themeFolder)), 0700); err != nil {
+		utils.Fatal(err)
+	}
+}
+
+// UserAsset .
+func UserAsset(appsFolderPath, themeFolder string) {
+	var assetsPath = getAssetsPath(themeFolder)
+	var xpuiPath = filepath.Join(appsFolderPath, "xpui")
+	if err := utils.Copy(assetsPath, xpuiPath, true, nil); err != nil {
+		utils.Fatal(err)
+	}
+}
+
+func htmlMod(htmlPath string, flags Flag) {
+	if len(flags.Extension) == 0 &&
+		!flags.HomeConfig &&
+		!flags.SidebarConfig &&
+		!flags.ExpFeatures {
+		return
+	}
+
+	extensionsHTML := "\n"
+	helperHTML := "\n"
+
+	if flags.InjectThemeJS {
+		extensionsHTML += "<script defer src='extensions/theme.js'></script>\n"
+	}
+
+	if flags.SidebarConfig {
+		helperHTML += "<script defer src='helper/sidebarConfig.js'></script>\n"
+	}
+
+	if flags.HomeConfig {
+		helperHTML += "<script defer src='helper/homeConfig.js'></script>\n"
+	}
+
+	if flags.ExpFeatures {
+		helperHTML += "<script defer src='helper/expFeatures.js'></script>\n"
+	}
+
+	if flags.CartifyVer != "" {
+		var extList string
+		for _, ext := range flags.Extension {
+			extList += fmt.Sprintf(`"%s",`, ext)
+		}
+
+		var customAppList string
+		for _, app := range flags.CustomApp {
+			customAppList += fmt.Sprintf(`"%s",`, app)
+		}
+
+		helperHTML += fmt.Sprintf(`<script>
+			Cartify.Config={};
+			Cartify.Config["version"]="%s";
+			Cartify.Config["current_theme"]="%s";
+			Cartify.Config["color_scheme"]="%s";
+			Cartify.Config["extensions"] = [%s];
+			Cartify.Config["custom_apps"] = [%s];
+			Cartify.Config["check_cartify_update"]=%v;
+		</script>
+		`, flags.CartifyVer, flags.CurrentTheme, flags.ColorScheme, extList, customAppList, flags.CheckCartifyUpdate)
+	}
+
+	for _, v := range flags.Extension {
+		if strings.HasSuffix(v, ".mjs") {
+			extensionsHTML += fmt.Sprintf("<script defer type='module' src='extensions/%s'></script>\n", v)
+		} else {
+			extensionsHTML += fmt.Sprintf("<script defer src='extensions/%s'></script>\n", v)
+		}
+	}
+
+	for _, v := range flags.CustomApp {
+		manifest, _, err := utils.GetAppManifest(v)
+		if err == nil {
+			for _, extensionFile := range manifest.ExtensionFiles {
+				if strings.HasSuffix(extensionFile, ".mjs") {
+					extensionsHTML += fmt.Sprintf("<script defer type='module' src='extensions/%s/%s'></script>\n", v, extensionFile)
+				} else {
+					extensionsHTML += fmt.Sprintf("<script defer src='extensions/%s/%s'></script>\n", v, extensionFile)
+				}
+			}
+		}
+	}
+
+	utils.ModifyFile(htmlPath, func(content string) string {
+		utils.Replace(
+			&content,
+			`<script defer="defer" src="/xpui-snapshot\.js"></script>`,
+			func(submatches ...string) string {
+				return `<script defer="defer" src="/xpui-modules.js"></script><script defer="defer" src="/xpui-snapshot.js"></script>`
+			})
+		utils.Replace(
+			&content,
+			`<\!-- Cartify helpers -->`,
+			func(submatches ...string) string {
+				return fmt.Sprintf("%s%s", submatches[0], helperHTML)
+			})
+		utils.Replace(
+			&content,
+			`</body>`,
+			func(submatches ...string) string {
+				return fmt.Sprintf("%s%s", extensionsHTML, submatches[0])
+			})
+		return content
+	})
+}
+
+func getUserCSS(themeFolder string) string {
+	if len(themeFolder) == 0 {
+		return ""
+	}
+
+	cssFilePath := filepath.Join(themeFolder, "user.css")
+	_, err := os.Stat(cssFilePath)
+
+	if err != nil {
+		return ""
+	}
+
+	content, err := os.ReadFile(cssFilePath)
+	if err != nil {
+		return ""
+	}
+
+	return string(content)
+}
+
+func getColorCSS(scheme map[string]string) string {
+	var variableList string
+	var variableRGBList string
+	mergedScheme := make(map[string]string)
+
+	for k, v := range scheme {
+		mergedScheme[k] = v
+	}
+
+	for k, v := range utils.BaseColorList {
+		if len(mergedScheme[k]) == 0 {
+			mergedScheme[k] = v
+		}
+	}
+
+	for k, v := range mergedScheme {
+		parsed := utils.ParseColor(v)
+		variableList += fmt.Sprintf("    --spice-%s: #%s;\n", k, parsed.Hex())
+		variableRGBList += fmt.Sprintf("    --spice-rgb-%s: %s;\n", k, parsed.RGB())
+	}
+
+	return fmt.Sprintf(":root {\n%s\n%s\n}\n", variableList, variableRGBList)
+}
+
+func insertCustomApp(jsPath string, flags Flag) {
+	utils.ModifyFile(jsPath, func(content string) string {
+		// React lazy loading patterns for dynamic imports
+		reactPatterns := []string{
+			// Sync pattern: X.lazy((() => Y.Z(123).then(W.bind(W, 456))))
+			`([\w_\$][\w_\$\d]*(?:\(\))?)\.lazy\(\((?:\(\)=>|function\(\)\{return )(\w+)\.(\w+)\(["']?[\w-]+["']?\)\.then\(\w+\.bind\(\w+,["']?[\w-]+["']?\)\)\}?\)\)`,
+			// Async pattern (1.2.78+): m.lazy(async()=>{...await o.e(123).then(...)})
+			`([\w_\$][\w_\$\d]*)\.lazy\(async\(\)=>\{(?:[^{}]|\{[^{}]*\})*await\s+(\w+)\.(\w+)\(["']?[\w-]+["']?\)\.then\(\w+\.bind\(\w+,["']?[\w-]+["']?\)\)`,
+			// Async Promise.all pattern (1.2.78+): m.lazy(async()=>await Promise.all([Y.Z(123),...]).then(...))
+			// Capture the chunk loader from the first entry inside Promise.all, not from .bind()
+			`([\w_\$][\w_\$\d]*(?:\(\))?)\.lazy\(async\(\)=>await\s+Promise\.all\(\[(\w+)\.(\w+)\(["']?[\w-]+["']?\)`,
+		}
+
+		// React element/route patterns for path matching
+		elementPatterns := []string{
+			// JSX pattern (1.2.78+): (0,S.jsx)(se.qh,{path:"/collection/*",element:...})
+			// Settings page should be more consistent with having no conditional renders
+			`(\([\w$\.,]+\))\(([\w\.]+),\{path:"/settings(?:/[\w\*]+)?",?(element|children)?`,
+			// createElement pattern: X.createElement(Y,{path:"/collection"...})
+			`([\w_\$][\w_\$\d]*(?:\(\))?\.createElement|\([\w$\.,]+\))\(([\w\.]+),\{path:"\/collection"(?:,(element|children)?[:.\w,{}()$/*"]+)?\}`,
+		}
+
+		reactSymbs, matchedReactPattern := utils.FindSymbolWithPattern(
+			"Custom app React symbols",
+			content,
+			reactPatterns)
+		eleSymbs, matchedElementPattern := utils.FindSymbolWithPattern(
+			"Custom app React Element",
+			content,
+			elementPatterns)
+
+		if (len(reactSymbs) < 2) || (len(eleSymbs) == 0) {
+			utils.PrintError("Spotify version mismatch with Cartify. Please report it on our github repository.")
+			utils.PrintInfo("cartify might have been updated for this version already. Please run `cartify update` to check for a new version.")
+			utils.PrintInfo("If one isn't available yet, please wait for an update to be released or downgrade Spotify to a supported version.")
+			return content
+		}
+
+		appMap := ""
+		appReactMap := ""
+		appEleMap := ""
+		cssEnableMap := ""
+		appNameArray := ""
+
+		// Spotify's new route system
+		wildcard := ""
+		if eleSymbs[2] == "" {
+			eleSymbs[2] = "children"
+		} else if eleSymbs[2] == "element" {
+			wildcard = "*"
+		}
+
+		for index, app := range flags.CustomApp {
+			appName := `cartify-routes-` + app
+			appMap += fmt.Sprintf(`"%s":"%s",`, appName, appName)
+			appNameArray += fmt.Sprintf(`"%s",`, app)
+
+			appReactMap += fmt.Sprintf(
+				`,CartifyApp%d=%s.lazy((()=>%s.%s("%s").then(%s.bind(%s,"%s"))))`,
+				index, reactSymbs[0], reactSymbs[1], reactSymbs[2],
+				appName, reactSymbs[1], reactSymbs[1], appName)
+
+			appEleMap += fmt.Sprintf(
+				`%s(%s,{path:"/%s/%s",pathV6:"/%s/*",%s:%s(CartifyApp%d,{})}),`,
+				eleSymbs[0], eleSymbs[1], app, wildcard, app, eleSymbs[2], eleSymbs[0], index)
+
+			cssEnableMap += fmt.Sprintf(`,"%s":1`, appName)
+		}
+
+		utils.Replace(
+			&content,
+			`\{(\d+:"xpui)`,
+			func(submatches ...string) string {
+				return fmt.Sprintf("{%s%s", appMap, submatches[1])
+			})
+
+		// Seek to the full matched React.lazy pattern
+		matchedReactPattern = utils.SeekToCloseParen(
+			content,
+			matchedReactPattern,
+			'(',
+			')',
+		)
+
+		content = strings.Replace(
+			content,
+			matchedReactPattern,
+			fmt.Sprintf("%s%s", matchedReactPattern, appReactMap),
+			1,
+		)
+
+		utils.ReplaceOnce(
+			&content,
+			matchedElementPattern,
+			func(submatches ...string) string {
+				return fmt.Sprintf("%s%s", appEleMap, submatches[0])
+			})
+
+		content = insertNavLink(content, appNameArray)
+
+		utils.ReplaceOnce(
+			&content,
+			`\d+:1,\d+:1,\d+:1`,
+			func(submatches ...string) string {
+				return fmt.Sprintf("%s%s", submatches[0], cssEnableMap)
+			})
+
+		return content
+	})
+}
+
+func insertNavLink(str string, appNameArray string) string {
+	// Library X
+	libraryXItemMatch := utils.SeekToCloseParen(
+		str,
+		`\("li",\{[^\{]*\{[^\{]*\{to:"\/search`,
+		'(', ')')
+
+	if libraryXItemMatch != "" {
+		str = strings.Replace(
+			str,
+			libraryXItemMatch,
+			fmt.Sprintf("%s,Cartify._renderNavLinks([%s], false)", libraryXItemMatch, appNameArray),
+			1)
+	}
+
+	utils.ReplaceOnceWithPriority(&str,
+		[]string{
+			// Global Navbar <= 1.2.45
+			`(,[a-zA-Z_\$][\w\$]*===(?:[a-zA-Z_\$][\w\$]*\.){2}HOME_NEXT_TO_NAVIGATION&&.+?)\]`,
+			// Global Navbar >= 1.2.60, greedy matching with enclosing brackets
+			`("global-nav-bar".*[[\w\$&|]*\(0,[a-zA-Z_\$][\w\$]*\.jsx\)\(\s*\w+,\s*\{\s*className:\w*\s*\}\s*\))\]`,
+			// Global Navbar >= 1.2.87
+			`(?s)("global-nav-bar".*?&&\s*\(0,\s*[a-zA-Z_\$][\w\$]*\.jsxs?\)\(\s*[a-zA-Z_\$][\w\$]*\s*,\s*\{\s*children:\s*)(\[\s*[\w\$]+\s*\?\s*\(0,\s*[a-zA-Z_\$][\w\$]*\.jsx\).*?\])(\s*\}\))`,
+			// Global Navbar >= 1.2.46, lazy matching
+			`("global-nav-bar".*?)(\(0,\s*[a-zA-Z_\$][\w\$]*\.jsx\))(\(\s*\w+,\s*\{\s*className:\w*\s*\}\s*\))`,
+		},
+		func(index int, submatches ...string) string {
+			switch index {
+			case 0, 1:
+				return fmt.Sprintf("%s,Cartify._renderNavLinks([%s], true)]", submatches[1], appNameArray)
+			case 2:
+				return fmt.Sprintf("%s[%s,Cartify._renderNavLinks([%s], true)].flat()%s", submatches[1], submatches[2], appNameArray, submatches[3])
+			case 3:
+				return fmt.Sprintf("%s[%s%s,Cartify._renderNavLinks([%s], true)].flat()", submatches[1], submatches[2], submatches[3], appNameArray)
+			}
+			return ""
+		},
+	)
+
+	return str
+}
+
+func insertHomeConfig(jsPath string, flags Flag) {
+	if !flags.HomeConfig {
+		return
+	}
+
+	utils.ModifyFile(jsPath, func(content string) string {
+		utils.ReplaceOnce(
+			&content,
+			`(createDesktopHomeFeatureActivationShelfEventFactory.*?)([\w\.]+)(\.map)`,
+			func(submatches ...string) string {
+				return fmt.Sprintf("%sCartifyHomeConfig.arrange(%s)%s", submatches[1], submatches[2], submatches[3])
+			})
+
+		// >= 1.2.40
+		utils.ReplaceOnce(
+			&content,
+			`(&&"HomeShortsSectionData".*?[\],}])([a-zA-Z])(\}\)?\()`,
+			func(submatches ...string) string {
+				return fmt.Sprintf("%sCartifyHomeConfig.arrange(%s)%s", submatches[1], submatches[2], submatches[3])
+			})
+
+		return content
+	})
+}
+
+func getAssetsPath(themeFolder string) string {
+	dir := filepath.Join(themeFolder, "assets")
+
+	if _, err := os.Stat(dir); err != nil {
+		return ""
+	}
+
+	return dir
+}
+
+func insertSidebarConfig(jsPath string, flags Flag) {
+	if !flags.SidebarConfig {
+		return
+	}
+
+	utils.ModifyFile(jsPath, func(content string) string {
+		utils.ReplaceOnce(
+			&content,
+			`return null!=\w+&&\w+\.totalLength(\?\w+\(\)\.createElement\(\w+,\{contextUri:)(\w+)\.uri`,
+			func(submatches ...string) string {
+				return fmt.Sprintf(`return true%s%s?.uri||""`, submatches[1], submatches[2])
+			})
+
+		return content
+	})
+}
+
+func insertExpFeatures(jsPath string, flags Flag) {
+	if !flags.ExpFeatures {
+		return
+	}
+
+	utils.ModifyFile(jsPath, func(content string) string {
+		utils.ReplaceOnce(
+			&content,
+			`(function \w+\((\w+)\)\{)(\w+ \w+=\w\.name;if\("internal")`,
+			func(submatches ...string) string {
+				return fmt.Sprintf("%s%s=Cartify.expFeatureOverride(%s);%s", submatches[1], submatches[2], submatches[2], submatches[3])
+			})
+
+		// utils.ReplaceOnce(
+		// 	&content,
+		// 	`(\w+\.fromJSON)(\s*=\s*function\b[^{]*{[^}]*})`,
+		// 	func(submatches ...string) string {
+		// 		return fmt.Sprintf("%s=Cartify.createInternalMap%s", submatches[1], submatches[2])
+		// 	})
+
+		utils.ReplaceOnce(
+			&content,
+			`(([\w$.]+\.fromJSON)\(\w+\)+;)(return ?[\w{}().,]+[\w$]+\.Provider,)(\{value:\{localConfiguration)`,
+			func(submatches ...string) string {
+				return fmt.Sprintf("%sCartify.createInternalMap=%s;%sCartify.RemoteConfigResolver=%s", submatches[1], submatches[2], submatches[3], submatches[4])
+			})
+
+		return content
+	})
+}
+
+func insertVersionInfo(jsPath string, flags Flag) {
+	utils.ModifyFile(jsPath, func(content string) string {
+		utils.ReplaceOnce(
+			&content,
+			`(\w+(?:\(\))?\.createElement|\([\w$\.,]+\))\([\w\."]+,[\w{}():,]+\.containerVersion\}?\),`,
+			func(submatches ...string) string {
+				return fmt.Sprintf(`%s%s("details",{children: [
+					%s("summary",{children: "cartify v" + Cartify.Config.version}),
+					%s("li",{children: "Theme: " + Cartify.Config.current_theme + (Cartify.Config.color_scheme && " / ") + Cartify.Config.color_scheme}),
+					%s("li",{children: "Extensions: " + Cartify.Config.extensions.join(", ")}),
+					%s("li",{children: "Custom apps: " + Cartify.Config.custom_apps.join(", ")}),
+					]}),`, submatches[0], submatches[1], submatches[1], submatches[1], submatches[1], submatches[1])
+			})
+		return content
+	})
+}
+
+

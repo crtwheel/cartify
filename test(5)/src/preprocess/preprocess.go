@@ -1,0 +1,1182 @@
+package preprocess
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+
+	"github.com/pterm/pterm"
+	"github.com/crtwheel/cartify/src/utils"
+)
+
+// Flag enables/disables preprocesses to be applied
+type Flag struct {
+	// DisableSentry prevents Sentry to send console log/error/warning to Spotify developers.
+	DisableSentry bool
+	// DisableLogging stops various elements to log user interaction.
+	DisableLogging bool
+	// RemoveRTL removes all Right-To-Left CSS rules to simplify CSS files.
+	RemoveRTL bool
+	// ExposeAPIs leaks Spotify's API, functions, objects to Cartify global object.
+	ExposeAPIs bool
+	SpotifyVer string
+}
+
+type Patch struct {
+	Name        string
+	Regex       string
+	Replacement func(submatches ...string) string
+	Once        bool
+}
+
+func applyPatches(input string, patches []Patch) string {
+	for _, patch := range patches {
+		if patch.Once {
+			utils.ReplaceOnce(&input, patch.Regex, patch.Replacement)
+		} else {
+			utils.Replace(&input, patch.Regex, patch.Replacement)
+		}
+	}
+	return input
+}
+
+func readRemoteCssMap(tag string, cssTranslationMap *map[string]string) error {
+	var cssMapURL string = "https://raw.githubusercontent.com/Cartify/cli/" + tag + "/css-map.json"
+	cssMapResp, err := http.Get(cssMapURL)
+	if err != nil {
+		return err
+	} else {
+		err := json.NewDecoder(cssMapResp.Body).Decode(cssTranslationMap)
+		if err != nil {
+			utils.PrintWarning("Remote CSS map JSON malformed.")
+			return err
+		}
+	}
+	return nil
+}
+
+func readLocalCssMap(cssTranslationMap *map[string]string) error {
+	cssMapLocalPath := path.Join(utils.GetExecutableDir(), "css-map.json")
+	cssMapContent, err := os.ReadFile(cssMapLocalPath)
+	if err != nil {
+		utils.PrintWarning("Cannot read local CSS map.")
+		return err
+	} else {
+		err = json.Unmarshal(cssMapContent, cssTranslationMap)
+		if err != nil {
+			utils.PrintWarning("Local CSS map JSON malformed.")
+			return err
+		}
+	}
+	return nil
+}
+
+func Start(version string, spotifyBasePath string, extractedAppsPath string, flags Flag) {
+	appPath := filepath.Join(extractedAppsPath, "xpui")
+	var cssTranslationMap = make(map[string]string)
+
+	if version != "Dev" {
+		fetchSpinner, _ := utils.Spinner.Start("Fetching remote CSS map")
+		tag, err := FetchLatestTagMatchingOrMain(version)
+		if err != nil {
+			fetchSpinner.Warning("Failed to fetch remote CSS map")
+			utils.PrintWarning(err.Error())
+			tag = version
+		}
+		if readRemoteCssMap(tag, &cssTranslationMap) != nil {
+			fetchSpinner.Warning("Failed to fetch remote CSS map")
+			utils.PrintInfo("Using local CSS map instead")
+			readLocalCssMap(&cssTranslationMap)
+		} else {
+			fetchSpinner.Success("Fetched remote CSS map")
+		}
+	} else {
+		utils.PrintInfo("Using local CSS map; in development environment")
+		readLocalCssMap(&cssTranslationMap)
+	}
+
+	cssMapPairs := make([]string, 0, len(cssTranslationMap)*4)
+	for k, v := range cssTranslationMap {
+		cssMapPairs = append(cssMapPairs, k+":", `"`+v+`":`)
+		cssMapPairs = append(cssMapPairs, k, v)
+	}
+	cssMapJSReplacer := strings.NewReplacer(cssMapPairs...)
+	cssMapBareKeySpaceRe := regexp.MustCompile(`\b[a-zA-Z0-9_]{16,21}[ \t]+:`)
+
+	verParts := strings.Split(flags.SpotifyVer, ".")
+	spotifyMajor, spotifyMinor, spotifyPatch := 0, 0, 0
+	if len(verParts) > 0 {
+		spotifyMajor, _ = strconv.Atoi(verParts[0])
+	}
+	if len(verParts) > 1 {
+		spotifyMinor, _ = strconv.Atoi(verParts[1])
+	}
+	if len(verParts) > 2 {
+		spotifyPatch, _ = strconv.Atoi(verParts[2])
+	}
+
+	var spotifyBinaryPath string
+	switch runtime.GOOS {
+	case "windows":
+		dllPath := filepath.Join(spotifyBasePath, "spotify.dll")
+		exePath := filepath.Join(spotifyBasePath, "spotify.exe")
+
+		if _, err := os.Stat(dllPath); err == nil {
+			spotifyBinaryPath = dllPath
+		} else if _, err := os.Stat(exePath); err == nil {
+			spotifyBinaryPath = exePath
+		} else {
+			utils.PrintError("Could not find spotify.dll or spotify.exe in Spotify installation directory")
+			utils.Fatal(errors.New("aborting the patching process due to missing Spotify binaries"))
+		}
+	case "darwin":
+		spotifyBinaryPath = filepath.Join(spotifyBasePath, "..", "MacOS", "Spotify")
+	}
+
+	if spotifyBinaryPath != "" {
+		if err := validateReleaseBuild(spotifyBinaryPath); err != nil {
+			utils.PrintError(err.Error())
+			utils.Fatal(errors.New("aborting the patching process due to unsupported build"))
+		}
+	}
+
+	frameworkResourcesPath := ""
+	switch runtime.GOOS {
+	case "darwin":
+		frameworkResourcesPath = filepath.Join(spotifyBasePath, "..", "Frameworks", "Chromium Embedded Framework.framework", "Resources")
+	case "windows", "linux":
+		frameworkResourcesPath = spotifyBasePath
+	default:
+		utils.PrintError("Unsupported OS for V8 snapshot finding: " + runtime.GOOS)
+	}
+
+	if frameworkResourcesPath != "" {
+		files, err := os.ReadDir(frameworkResourcesPath)
+		if err != nil {
+			utils.PrintWarning(fmt.Sprintf("Could not read directory %s for V8 snapshots: %v", frameworkResourcesPath, err))
+		} else {
+			for _, file := range files {
+				if !file.IsDir() && strings.HasPrefix(file.Name(), "v8_context_snapshot") && strings.HasSuffix(file.Name(), ".bin") {
+					binFilePath := filepath.Join(frameworkResourcesPath, file.Name())
+
+					startMarker := []byte("var __webpack_modules__={")
+					endMarker := []byte("xpui-modules.js.map")
+
+					embeddedString, _, _, err := utils.ReadStringFromUTF16Binary(binFilePath, startMarker, endMarker)
+					if err != nil {
+						utils.PrintWarning(fmt.Sprintf("Could not process %s: %v", binFilePath, err))
+						utils.PrintInfo("If above warning says 'could not find start marker', you can safely ignore that error if you're on Spotify 1.2.63 or lower and you're not on macOS Intel.")
+						utils.PrintInfo("However, if you're on 1.2.64 or higher, please report this issue")
+						continue
+					}
+
+					err = utils.CreateFile(filepath.Join(appPath, "xpui-modules.js"), embeddedString)
+					if err != nil {
+						utils.PrintWarning(fmt.Sprintf("Could not create xpui-modules.js: %v", err))
+						break
+					} else {
+						utils.PrintSuccess("Finished extracting V8 snapshot blob to local file")
+						break
+					}
+				}
+			}
+		}
+	}
+
+	var filesToPatch []string
+	filepath.Walk(appPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		ext := filepath.Ext(info.Name())
+		if ext == ".js" || ext == ".css" || ext == ".html" {
+			filesToPatch = append(filesToPatch, path)
+		}
+		return nil
+	})
+
+	totalFiles := len(filesToPatch)
+
+	bar, _ := pterm.DefaultProgressbar.
+		WithTotal(totalFiles).
+		WithTitle("Patching files").
+		WithTitleStyle(pterm.NewStyle(pterm.Bold)).
+		WithShowCount(true).
+		Start()
+	for _, path := range filesToPatch {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		fileName := info.Name()
+		extension := filepath.Ext(fileName)
+
+		switch extension {
+		case ".js":
+			utils.ModifyFile(path, func(content string) string {
+				if flags.DisableSentry && (fileName == "xpui.js" || fileName == "xpui-snapshot.js") {
+					content = disableSentry(content)
+				}
+
+				if flags.DisableLogging {
+					content = disableLogging(content)
+				}
+
+				if flags.ExposeAPIs {
+					switch fileName {
+					case "xpui-modules.js", "xpui-snapshot.js":
+						content = exposeAPIs_main(content)
+						content = exposeAPIs_vendor(content)
+					case "xpui.js":
+						content = exposeAPIs_main(content)
+						if spotifyMajor >= 1 && spotifyMinor >= 2 && spotifyPatch >= 57 {
+							content = exposeAPIs_vendor(content)
+						}
+					case "vendor~xpui.js":
+						content = exposeAPIs_vendor(content)
+					}
+
+					if spotifyMajor >= 1 && spotifyMinor >= 2 && (spotifyPatch >= 28 && spotifyPatch <= 57) {
+						utils.ReplaceOnce(&content, `(typeName\])`, func(submatches ...string) string {
+							return fmt.Sprintf(`%s || []`, submatches[1])
+						})
+					}
+
+					// to avoid syntaxerror on Spotify 1.2.78 and above
+					if spotifyMajor >= 1 && spotifyMinor >= 2 && spotifyPatch < 78 {
+						utils.ReplaceOnce(&content, `\(\({[^}]*,\s*imageSrc`, func(submatches ...string) string {
+							return fmt.Sprintf("cartify.Snackbar.enqueueImageSnackbar=%s", submatches[0])
+						})
+					}
+
+					content = additionalPatches(content)
+				}
+
+				if fileName == "dwp-top-bar.js" || fileName == "dwp-now-playing-bar.js" || fileName == "dwp-home-chips-row.js" {
+					utils.ReplaceOnce(&content, `e\.state\.cinemaState`, func(submatches ...string) string {
+						return "e.state?.cinemaState"
+					})
+				}
+
+				// Bare keys with whitespace before the colon
+				// the replacer's k+":" entry can't match these, so handle them first
+				content = cssMapBareKeySpaceRe.ReplaceAllStringFunc(content, func(match string) string {
+					colonIdx := strings.LastIndex(match, ":")
+					key := strings.TrimRight(match[:colonIdx], " \t")
+					if v, ok := cssTranslationMap[key]; ok {
+						return `"` + v + `":`
+					}
+					return match
+				})
+				// Single pass: k+":" → "v": for bare keys,
+				// k -> v for all other occurrences
+				content = cssMapJSReplacer.Replace(content)
+				content = colorVariableReplaceForJS(content)
+
+				return content
+			})
+		case ".css":
+			utils.ModifyFile(path, func(content string) string {
+				for k, v := range cssTranslationMap {
+					utils.Replace(&content, k, func(submatches ...string) string {
+						return v
+					})
+				}
+				if flags.RemoveRTL {
+					content = removeRTL(content)
+				}
+				if fileName == "xpui.css" || fileName == "xpui-snapshot.css" {
+					content = content + `
+.main-gridContainer-fixedWidth{grid-template-columns:repeat(auto-fill,var(--column-width));width:calc((var(--column-count) - 1) * var(--grid-gap)) + var(--column-count) * var(--column-width) )}.main-cardImage-imageWrapper{background-color:var(--card-color,#333);border-radius:6px;-webkit-box-shadow:0 8px 24px rgba(0,0,0,.5);box-shadow:0 8px 24px rgba(0,0,0,.5);padding-bottom:100%;position:relative;width:100%}.main-card-imagePlaceholder,.main-cardImage-image{height:100%;left:0;position:absolute;top:0;width:100%}.main-card-card{border-radius:8px;-webkit-box-flex:1;background:var(--spice-player);-ms-flex:1;flex:1;isolation:isolate;padding:16px;position:relative;-webkit-transition:background-color .3s;transition:background-color .3s;width:100%}.main-card-card:hover,.main-card-card[data-context-menu-open=true]{background:var(--spice-card)}.main-card-card:focus-within{background:var(--spice-card)}.main-card-card .main-card-cardLink{position:absolute;z-index:0}.RjYPjR7FsVf42b3a5Efm:before,.Z78JmW4GUvvxLXSFjb7R:not(:last-child):after{content:"â€¢";margin:0 4px}.main-card-card a,.main-card-card button{position:relative;z-index:1}.main-card-cardLink{bottom:0;content:"";cursor:pointer;left:0;overflow:hidden;right:0;text-indent:100%;top:0;white-space:nowrap;z-index:0}.main-card-cardTitle{z-index:1}.main-card-cardTitleLink:focus,.main-card-cardTitleLink:hover{text-decoration:none}.Wmr5qZ5jui6X37XCrChA{opacity:0}.main-card-newEpisodeIndicator{margin-top:3px}.main-card-imageContainer{pointer-events:none;position:relative}.main-card-imageContainerOld,.main-card-imageContainerSkeleton{margin-bottom:16px}.main-card-cardMetadata{min-height:62px;-webkit-line-clamp:2}.main-card-DownloadStatusIndicator{bottom:12px;inset-inline-end:12px;position:absolute}.main-card-PlayButtonContainer{border-radius:500px;bottom:8px;-webkit-box-shadow:0 8px 8px rgba(var(--spice-rgb-shadow),.3);box-shadow:0 8px 8px rgba(var(--spice-rgb-shadow),.3);inset-inline-end:8px;opacity:0;pointer-events:none;position:absolute;-webkit-transform:translateY(8px);transform:translateY(8px);z-index:2}@media(pointer:coarse){.main-card-PlayButtonContainer{display:none}}@media(prefers-reduced-motion:no-preference){.main-card-PlayButtonContainer{-webkit-transition:opacity .2s ease-out,-webkit-transform .2s ease-out;transition:transform .2s ease-out,opacity .2s ease-out,-webkit-transform .2s ease-out}}.main-card-PlayButtonContainerVisible{opacity:1;pointer-events:auto;position:absolute;-webkit-transform:translateY(0);transform:translateY(0)}.main-card-cardContainer{--animation-speed:0.2s!important;white-space:normal}.main-card-card:hover .main-card-PlayButtonContainer,.main-card-cardContainer:hover .main-card-PlayButtonContainer{opacity:1;-webkit-transform:translateY(0);transform:translateY(0)}.main-card-card:focus-within .main-card-PlayButtonContainer,.main-card-cardContainer:focus-within{opacity:1;-webkit-transform:translateY(0);transform:translateY(0)}@media(pointer:fine){.main-card-card .main-card-cardLink:hover{cursor:pointer}.main-card-card:hover .main-card-PlayButtonContainer,.main-card-cardContainer:hover .main-card-PlayButtonContainer{opacity:1;pointer-events:auto;position:absolute}.main-card-card:focus-within .main-card-PlayButtonContainer,.main-card-cardContainer:focus-within .main-card-PlayButtonContainer{opacity:1;pointer-events:auto;position:absolute}}.main-card-cardMetadata,.v3isO2phyJAoZRkmme0G{display:-webkit-box;-webkit-box-orient:vertical}
+					`
+				}
+				return content
+			})
+
+		case ".html":
+			utils.ModifyFile(path, func(content string) string {
+				var tags string
+				tags += "<link rel='stylesheet' class='userCSS' href='colors.css'>\n"
+				tags += "<link rel='stylesheet' class='userCSS' href='user.css'>\n"
+
+				if flags.ExposeAPIs {
+					tags += "<script src='helper/CartifyWrapper.js'></script>\n"
+					tags += "<!-- Cartify helpers -->\n"
+				}
+
+				utils.Replace(&content, `<body(\sclass="[^"]*")?>`, func(submatches ...string) string {
+					return fmt.Sprintf("%s\n%s", submatches[0], tags)
+				})
+
+				return content
+			})
+		}
+
+		bar.Increment()
+	}
+}
+
+// StartCSS modifies all CSS files in extractedAppsPath to change
+// all colors value with CSS variables.
+func StartCSS(extractedAppsPath string) {
+	appPath := filepath.Join(extractedAppsPath, "xpui")
+	filepath.Walk(appPath, func(path string, info os.FileInfo, err error) error {
+		// temp so text won't be black ._.
+		if strings.HasPrefix(info.Name(), "pip-mini-player") && strings.HasSuffix(info.Name(), ".css") {
+			return nil
+		}
+
+		if filepath.Ext(info.Name()) == ".css" {
+			utils.ModifyFile(path, func(content string) string {
+				return colorVariableReplace(content)
+			})
+		}
+		return nil
+	})
+}
+
+func colorVariableReplace(content string) string {
+	colorPatches := []Patch{
+		{
+			Name:  "CSS: --spice-player",
+			Regex: `#(181818|212121)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-player)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-card",
+			Regex: `#282828\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-card)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-main-elevated",
+			Regex: `#(242424|1f1f1f)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-main-elevated)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-main",
+			Regex: `#121212\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-main)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-card-elevated",
+			Regex: `#(242424|1f1f1f)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-card-elevated)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-highlight",
+			Regex: `#1a1a1a\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-highlight)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-highlight-elevated",
+			Regex: `#2a2a2a\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-highlight-elevated)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-sidebar",
+			Regex: `#(000|000000)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-sidebar)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-text",
+			Regex: `(white;|#fff|#ffffff|#f8f8f8)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-text)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-subtext",
+			Regex: `#(b3b3b3|a7a7a7)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-subtext)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-button",
+			Regex: `#(1db954|1877f2)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-button)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-button-active",
+			Regex: `#(1ed760|1fdf64|169c46)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-button-active)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-button-disabled",
+			Regex: `#535353\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-button-disabled)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-tab-active",
+			Regex: `#(333|333333)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-tab-active)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-misc",
+			Regex: `#7f7f7f\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-misc)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-notification",
+			Regex: `#(4687d6|2e77d0)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-notification)"
+			},
+		},
+		{
+			Name:  "CSS: --spice-notification-error",
+			Regex: `#(e22134|cd1a2b)\b`,
+			Replacement: func(submatches ...string) string {
+				return "var(--spice-notification-error)"
+			},
+		},
+		{
+			Name:  "CSS (rgba): --spice-main",
+			Regex: `rgba\(18,18,18,([\d\.]+)\)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("rgba(var(--spice-main),%s)", submatches[1])
+			},
+		},
+		{
+			Name:  "CSS (rgba): --spice-card",
+			Regex: `rgba\(40,40,40,([\d\.]+)\)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("rgba(var(--spice-card),%s)", submatches[1])
+			},
+		},
+		{
+			Name:  "CSS (rgba): --spice-rgb-shadow",
+			Regex: `rgba\(0,0,0,([\d\.]+)\)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("rgba(var(--spice-rgb-shadow),%s)", submatches[1])
+			},
+		},
+		{
+			Name:  "CSS (hsla): --spice-rgb-text",
+			Regex: `hsla\(0,0%,100%,\.9\)`,
+			Replacement: func(submatches ...string) string {
+				return "rgba(var(--spice-rgb-text),.9)"
+			},
+		},
+		{
+			Name:  "CSS (hsla): --spice-rgb-selected-row",
+			Regex: `hsla\(0,0%,100%,([\d\.]+)\)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("rgba(var(--spice-rgb-selected-row),%s)", submatches[1])
+			},
+		},
+	}
+
+	return applyPatches(content, colorPatches)
+}
+
+func colorVariableReplaceForJS(content string) string {
+	colorVariablePatches := []Patch{
+		{
+			Name:  "CSS (JS): --spice-button",
+			Regex: `"#1db954"`,
+			Replacement: func(submatches ...string) string {
+				return ` getComputedStyle(document.body).getPropertyValue("--spice-button").trim()`
+			},
+		},
+		{
+			Name:  "CSS (JS): --spice-subtext",
+			Regex: `"#b3b3b3"`,
+			Replacement: func(submatches ...string) string {
+				return ` getComputedStyle(document.body).getPropertyValue("--spice-subtext").trim()`
+			},
+		},
+		{
+			Name:  "CSS (JS): --spice-text",
+			Regex: `"#ffffff"`,
+			Replacement: func(submatches ...string) string {
+				return ` getComputedStyle(document.body).getPropertyValue("--spice-text").trim()`
+			},
+		},
+		{
+			Name:  "CSS (JS): --spice-text white",
+			Regex: `color:"white"`,
+			Replacement: func(submatches ...string) string {
+				return `color:"var(--spice-text)"`
+			},
+		},
+	}
+
+	return applyPatches(content, colorVariablePatches)
+}
+
+func disableSentry(input string) string {
+	//utils.Replace(&input, `\(([^,]+),([^,]+),\{sampleRate:([^,]+),tracesSampleRate:([^,]+)(,.*?)?\}`, func(submatches ...string) string {
+	//	return fmt.Sprintf(",%s", submatches[0])
+	//})
+	// Spotify enables sentry only for versions that are newer than 30 days old.
+	utils.Replace(&input, "/864e5<30", func(submatches ...string) string {
+		return "<0"
+	})
+	return input
+}
+
+func disableLogging(input string) string {
+	loggingPatches := []Patch{
+		{
+			Name:  "Remove sp://logging/v3/*",
+			Regex: `sp://logging/v3/\w+`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+		{
+			Name:  "Remove /v3/events endpoints",
+			Regex: `[^"\/]+\/[^"\/]+\/(public\/)?v3\/events`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+		{
+			Name:  "Disable registerEventListeners",
+			Regex: `key:"registerEventListeners",value:function\(\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable logInteraction",
+			Regex: `key:"logInteraction",value:function\([\w,]+\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn {interactionId:null,pageInstanceId:null};", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable logNonAuthInteraction",
+			Regex: `key:"logNonAuthInteraction",value:function\([\w,]+\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn {interactionId:null,pageInstanceId:null};", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable logImpression",
+			Regex: `key:"logImpression",value:function\([\w,]+\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable logNonAuthImpression",
+			Regex: `key:"logNonAuthImpression",value:function\([\w,]+\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable logNavigation",
+			Regex: `key:"logNavigation",value:function\([\w,]+\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable handleBackgroundStates",
+			Regex: `key:"handleBackgroundStates",value:function\(\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable createLoggingParams",
+			Regex: `key:"createLoggingParams",value:function\([\w,]+\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable initSendingEvents",
+			Regex: `key:"initSendingEvents",value:function\(\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable flush",
+			Regex: `key:"flush",value:function\(\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable send",
+			Regex: `(\{key:"send",value:function\([\w,]+\))\{[\d\w\s,{}()[\]\.,!\?=>&|;:_""]+?\}(\},\{key:"hasContext")`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%s{return;}%s", submatches[1], submatches[2])
+			},
+		},
+		{
+			Name:  "Disable lastFlush",
+			Regex: `key:"lastFlush",value:function\(\)\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn Promise.resolve({fired:true});", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable addItemInEventsStorage",
+			Regex: `key:"addItemInEventsStorage",value:function\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable createLoggingParams (new)",
+			Regex: `key:"createLoggingParams",value:function\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn {interactionIds:null,pageInstanceIds:null};", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable addEventsToESSData",
+			Regex: `key:"addEventsToESSData",value:function\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable registerEventListeners (new)",
+			Regex: `registerEventListeners\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable logInteraction (new)",
+			Regex: `logInteraction\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn {interactionId:null,pageInstanceId:null};", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable logImpression (new)",
+			Regex: `logImpression\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable logNavigation (new)",
+			Regex: `logNavigation\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable handleBackgroundStates (new)",
+			Regex: `handleBackgroundStates\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable initSendingEvents (new)",
+			Regex: `initSendingEvents\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable sendEvents",
+			Regex: `sendEvents\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable storeEvent",
+			Regex: `storeEvent\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable lastFlush (new)",
+			Regex: `lastFlush\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn Promise.resolve({fired:true});", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable addItemInEventsStorage (new)",
+			Regex: `addItemInEventsStorage\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable createLoggingParams (new)",
+			Regex: `createLoggingParams\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn {interactionIds:null,pageInstanceIds:null};", submatches[0])
+			},
+		},
+		{
+			Name:  "Disable addEventsToESSData (new)",
+			Regex: `addEventsToESSData\([^)]*\)\s*\{`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sreturn;", submatches[0])
+			},
+		},
+	}
+	return applyPatches(input, loggingPatches)
+}
+
+func removeRTL(input string) string {
+	rtlPatches := []Patch{
+		{
+			Name:  "Remove }[dir=ltr]",
+			Regex: `}\[dir=ltr\]\s?`,
+			Replacement: func(submatches ...string) string {
+				return "} "
+			},
+		},
+		{
+			Name:  "Remove html[dir=ltr]",
+			Regex: `html\[dir=ltr\]`,
+			Replacement: func(submatches ...string) string {
+				return "html"
+			},
+		},
+		{
+			Name:  "Remove ', [dir=rtl]' selectors",
+			Regex: `,\s?\[dir=rtl\].+?(\{.+?\})`,
+			Replacement: func(submatches ...string) string {
+				return submatches[1]
+			},
+		},
+		{
+			Name:  "Remove [something][dir=rtl] blocks",
+			Regex: `[\w\-\.]+\[dir=rtl\].+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+		{
+			Name:  "Remove }[lang=ar] blocks",
+			Regex: `\}\[lang=ar\].+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return "}"
+			},
+		},
+		{
+			Name:  "Remove }[dir=rtl] blocks",
+			Regex: `\}\[dir=rtl\].+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return "}"
+			},
+		},
+		{
+			Name:  "Remove }html[dir=rtl] blocks",
+			Regex: `\}html\[dir=rtl\].+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return "}"
+			},
+		},
+		{
+			Name:  "Remove }html[lang=ar] blocks",
+			Regex: `\}html\[lang=ar\].+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return "}"
+			},
+		},
+		{
+			Name:  "Remove [lang=ar] blocks",
+			Regex: `\[lang=ar\].+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+		{
+			Name:  "Remove html[dir=rtl] blocks",
+			Regex: `html\[dir=rtl\].+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+		{
+			Name:  "Remove html[lang=ar] blocks",
+			Regex: `html\[lang=ar\].+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+		{
+			Name:  "Remove [dir=rtl] blocks",
+			Regex: `\[dir=rtl\][^)]+?\{.+?\}`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+	}
+
+	return applyPatches(input, rtlPatches)
+}
+
+func additionalPatches(input string) string {
+	graphQLPatches := []Patch{
+		{
+			Name:  "GraphQL definitions (<=1.2.30)",
+			Regex: `((?:\w+ ?)?[\w$]+=)(\{kind:"Document",definitions:\[\{(?:\w+:[\w"]+,)+name:\{(?:\w+:[\w"]+,?)+value:("\w+"))`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sCartify.GraphQL.Definitions[%s]=%s", submatches[1], submatches[3], submatches[2])
+			},
+		},
+		{
+			Name:  "GraphQL definitions (>=1.2.31)",
+			Regex: `(=new [\w_\$][\w_\$\d]*\.[\w_\$][\w_\$\d]*\("(\w+)","(query|mutation)","[\w\d]{64}",null\))`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf(`=Cartify.GraphQL.Definitions["%s"]%s`, submatches[2], submatches[1])
+			},
+		},
+	}
+
+	return applyPatches(input, graphQLPatches)
+}
+
+func exposeAPIs_main(input string) string {
+	inputContextMenu := utils.FindFirstMatch(input, `.*(?:value:"contextmenu"|"[^"]*":"context-menu")`)
+	if len(inputContextMenu) > 0 {
+		croppedInput := inputContextMenu[0]
+		react := utils.FindLastMatch(croppedInput, `([a-zA-Z_\$][\w\$]*)\.useRef`)[1]
+		candicates := utils.FindLastMatch(croppedInput, `\(\{[^}]*menu:([a-zA-Z_\$][\w\$]*),[^}]*trigger:([a-zA-Z_\$][\w\$]*),[^}]*triggerRef:([a-zA-Z_\$][\w\$]*)`)
+		oldCandicates := utils.FindLastMatch(croppedInput, `([a-zA-Z_\$][\w\$]*)=[\w_$]+\.menu[^}]*,([a-zA-Z_\$][\w\$]*)=[\w_$]+\.trigger[^}]*,([a-zA-Z_\$][\w\$]*)=[\w_$]+\.triggerRef`)
+		var menu, trigger, target string
+		if len(oldCandicates) != 0 {
+			menu = oldCandicates[1]
+			trigger = oldCandicates[2]
+			target = oldCandicates[3]
+		} else if len(candicates) != 0 {
+			menu = candicates[1]
+			trigger = candicates[2]
+			target = candicates[3]
+		} else {
+			menu = "e.menu"
+			trigger = "e.trigger"
+			target = "e.triggerRef"
+		}
+
+		utils.Replace(&input, `\(0,([\w_$]+)\.jsx\)\((?:[\w_$]+\.[\w_$]+,\{value:"contextmenu"[^}]+\}\)\}\)|"[\w-]+",\{[^}]+:"context-menu"[^}]+\}\))`, func(submatches ...string) string {
+			return fmt.Sprintf("(0,%s.jsx)((Cartify.ContextMenuV2._context||(Cartify.ContextMenuV2._context=%s.createContext(null))).Provider,{value:{props:%s?.props,trigger:%s,target:%s},children:%s})", submatches[1], react, menu, trigger, target, submatches[0])
+		})
+	}
+
+	xpuiPatches := []Patch{
+		{
+			Name:  "showNotification",
+			Regex: `(?:\w+ |,)([\w$]+)=(\([\w$]+=[\w$]+\.dispatch)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf(`;globalThis.Cartify.showNotification=(message,isError=false,msTimeout)=>%s({message,feedbackType:isError?"ERROR":"NOTICE",msTimeout});const %s=%s`, submatches[1], submatches[1], submatches[2])
+			},
+		},
+		{
+			Name:  "Remove list of exclusive shows",
+			Regex: `\["spotify:show.+?\]`,
+			Replacement: func(submatches ...string) string {
+				return "[]"
+			},
+		},
+		{
+			Name:  "Remove Star Wars easter eggs",
+			Regex: `\w+\(\)\.createElement\(\w+,\{onChange:this\.handleSaberStateChange\}\),`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+		{
+			Name:  "Remove data-testid",
+			Regex: `"data-testid":`,
+			Replacement: func(submatches ...string) string {
+				return `"":`
+			},
+		},
+		{
+			Name:  "Expose PlatformAPI",
+			Regex: `((?:setTitlebarHeight|registerFactory)[\w(){}<>:.,&$!=;""?!#%/\- ]+)(\{version:[a-zA-Z_\$][\w\$]*,)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sCartify._platform=%s", submatches[1], submatches[2])
+			},
+		},
+		{
+			Name:  "Redux store",
+			Regex: `(,[\w$]+=)(([$\w,.:=;(){}]+\(\{session:[\w$]+,features:[\w$]+,seoExperiment:[\w$]+\}))`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sCartify.Platform.ReduxStore=%s", submatches[1], submatches[2])
+			},
+		},
+		{
+			Name:  "React Component: Platform Provider",
+			Regex: `(,[$\w]+=)((function\([\w$]{1}\)\{var [\w$]+=[\w$]+\.platform,[\w$]+=[\w$]+\.children,)|(\(\{platform:[\w$]+,children:[\w$]+\}\)=>\{))`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sCartify.ReactComponent.PlatformProvider=%s", submatches[1], submatches[2])
+			},
+		},
+		{
+			Name:  "Prevent breaking popupLyrics",
+			Regex: `document.pictureInPictureElement&&\(\w+.current=[!\w]+,document\.exitPictureInPicture\(\)\),\w+\.current=null`,
+			Replacement: func(submatches ...string) string {
+				return ""
+			},
+		},
+		{
+			Name:  "Spotify Custom Snackbar Interfaces (<=1.2.37)",
+			Regex: `\b\w\s*\(\)\s*[^;,]*enqueueCustomSnackbar:\s*(\w)\s*[^;]*;`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sCartify.Snackbar.enqueueCustomSnackbar=%s;", submatches[0], submatches[1])
+			},
+		},
+		{
+			Name:  "Spotify Custom Snackbar Interfaces (>=1.2.38)",
+			Regex: `(=)[^=]*\(\)\.enqueueCustomSnackbar;`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("=Cartify.Snackbar.enqueueCustomSnackbar%s;", submatches[0])
+			},
+		},
+		{
+			Name:  "Spotify Image Snackbar Interface",
+			Regex: `(=)(\(\({[^}]*,\s*imageSrc)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sCartify.Snackbar.enqueueImageSnackbar=%s", submatches[1], submatches[2])
+			},
+		},
+		{
+			Name:  "React Component: Navigation for navLinks",
+			Regex: `(;const [\w\d]+=)((?:\(0,[\w\d]+\.memo\))[\(\d,\w\.\){:}=]+\=[\d\w]+\.[\d\w]+\.getLocaleForURLPath\(\))`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%sCartify.ReactComponent.Navigation=%s", submatches[1], submatches[2])
+			},
+			Once: true,
+		},
+		{
+			Name:  "Context Menu V2",
+			Regex: `("Menu".+?children:)([\w$][\w$\d]*)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%s[Cartify.ContextMenuV2.renderItems(),%s].flat()", submatches[1], submatches[2])
+			},
+		},
+	}
+
+	return applyPatches(input, xpuiPatches)
+}
+
+func exposeAPIs_vendor(input string) string {
+	// URI
+	utils.Replace(
+		&input,
+		`,(\w+)\.prototype\.toAppType`,
+		func(submatches ...string) string {
+			return fmt.Sprintf(`,(globalThis.Cartify.URI=%s)%s`, submatches[1], submatches[0])
+		})
+	vendorPatches := []Patch{
+		{
+			Name:  "cartify.URI",
+			Regex: `,(\w+)\.prototype\.toAppType`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf(`,(globalThis.Cartify.URI=%s)%s`, submatches[1], submatches[0])
+			},
+		},
+		{
+			Name:  "Map styled-components classes",
+			Regex: `(\w+ [\w$_]+)=[\w$_]+\([\w$_]+>>>0\)`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%s=Cartify._getStyledClassName(arguments,this)", submatches[1])
+			},
+		},
+		{
+			Name:  "Tippy.js",
+			Regex: `([\w\$_]+)\.setDefaultProps=`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("cartify.Tippy=%s;%s", submatches[1], submatches[0])
+			},
+		},
+		{
+			Name:  "Flipper components",
+			Regex: `([\w$]+)=((?:function|\()([\w$.,{}()= ]+(?:springConfig|overshootClamping)){2})`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("%s=Cartify.ReactFlipToolkit.spring=%s", submatches[1], submatches[2])
+			},
+		},
+		{
+			// https://github.com/iamhosseindhv/notistack
+			Name:  "Snackbar",
+			Regex: `\w+\s*=\s*\w\.call\(this,[^)]+\)\s*\|\|\s*this\)\.enqueueSnackbar`,
+			Replacement: func(submatches ...string) string {
+				return fmt.Sprintf("cartify.Snackbar=%s", submatches[0])
+			},
+		},
+	}
+
+	// URI after 1.2.4
+	if !strings.Contains(input, "cartify.URI") {
+		URIObj := regexp.MustCompile(`(?:class ([\w$_]+)\{constructor|([\w$_]+)=function\(\)\{function ?[\w$_]+)\([\w$.,={}]+\)\{[\w !?:=.,>&(){}[\];]*this\.hasBase62Id`).FindStringSubmatch(input)
+
+		if len(URIObj) != 0 {
+			URI := utils.SeekToCloseParen(
+				input,
+				`\{(?:constructor|function ?[\w$_]+)\([\w$.,={}]+\)\{[\w !?:=.,>&(){}[\];]*this\.hasBase62Id`,
+				'{', '}')
+
+			if URIObj[1] == "" {
+				URIObj[1] = URIObj[2]
+				// Class is a self-invoking function
+				URI = fmt.Sprintf("%s()", URI)
+			}
+
+			input = strings.Replace(
+				input,
+				URI,
+				fmt.Sprintf("%s;Cartify.URI=%s;", URI, URIObj[1]),
+				1)
+		}
+	}
+
+	return applyPatches(input, vendorPatches)
+}
+
+func validateReleaseBuild(spotifyBinaryPath string) error {
+	fileContent, err := os.ReadFile(spotifyBinaryPath)
+	if err != nil {
+		return fmt.Errorf("could not read %s: %w", filepath.Base(spotifyBinaryPath), err)
+	}
+
+	buildRegex := regexp.MustCompile(`(Master|Release|PR|Local) Build.+(?:cef_)?(\d+\.\d+\.\d+\+g[0-9a-f]+\+chromium-\d+\.\d+\.\d+\.\d+)`)
+	matches := buildRegex.FindSubmatch(fileContent)
+
+	if len(matches) == 0 {
+		utils.PrintWarning(fmt.Sprintf("Could not detect Spotify build type in %s, skipping validation", filepath.Base(spotifyBinaryPath)))
+		return nil
+	}
+
+	buildType := string(matches[1])
+	if buildType != "Release" {
+		return fmt.Errorf("detected %s Spotify build! Cartify works only on Release builds. Please install latest Release version of Spotify", buildType)
+	}
+
+	utils.PrintSuccess(fmt.Sprintf("Spotify's build type is %s. Continuing...", string(matches[1])))
+	return nil
+}
+
+type githubRelease = utils.GithubRelease
+
+func splitVersion(version string) ([3]int, error) {
+	vstring := version
+	if vstring[0:1] == "v" {
+		vstring = version[1:]
+	}
+	vSplit := strings.Split(vstring, ".")
+	var vInts [3]int
+	if len(vSplit) != 3 {
+		return [3]int{}, errors.New("invalid version string")
+	}
+	for i := range 3 {
+		conv, err := strconv.Atoi(vSplit[i])
+		if err != nil {
+			return [3]int{}, err
+		}
+		vInts[i] = conv
+	}
+	return vInts, nil
+}
+
+func FetchLatestTagMatchingOrMain(version string) (string, error) {
+	tag, err := utils.FetchLatestTag()
+	if err != nil {
+		return "", err
+	}
+	ver, err := splitVersion(tag)
+	if err != nil {
+		return "", err
+	}
+	versionS, err := splitVersion(version)
+	if err != nil {
+		return "", err
+	}
+	// major version matches latest, use main branch
+	if ver[0] == versionS[0] && ver[1] == versionS[1] {
+		return "main", nil
+	} else {
+		return FetchLatestTagMatchingVersion(version)
+	}
+}
+
+func FetchLatestTagMatchingVersion(version string) (string, error) {
+	if version == "Dev" {
+		return "Dev", nil
+	}
+	res, err := http.Get("https://api.github.com/repos/crtwheel/cartify/releases")
+	if err != nil {
+		return "", err
+	}
+
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var releases []githubRelease
+	if err = json.Unmarshal(body, &releases); err != nil {
+		return "", err
+	}
+	curVer := strings.Split(version, ".")
+	curVerMin, err2 := strconv.Atoi(curVer[2])
+	if err2 != nil {
+		return "", err2
+	}
+	for _, rel := range releases {
+		ver := strings.Split(rel.TagName[1:], ".")
+		if len(ver) != 3 {
+			break
+		} else {
+			verMin, err := strconv.Atoi(ver[2])
+			if err != nil {
+				return "", err
+			}
+			if ver[0] == curVer[0] && ver[1] == curVer[1] && verMin > curVerMin {
+				curVerMin = verMin
+			}
+		}
+	}
+	return "v" + curVer[0] + "." + curVer[1] + "." + strconv.Itoa(curVerMin), nil
+}
+
+
+
